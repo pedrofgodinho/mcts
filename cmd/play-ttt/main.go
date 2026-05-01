@@ -34,7 +34,8 @@ func main() {
 	}
 
 	reader := bufio.NewReader(os.Stdin)
-	agent := mcts.NewAgent[tictactoe.Game, tictactoe.Move](tictactoe.New())
+	evaluator := mcts.RandomRolloutEvaluator[tictactoe.Game, tictactoe.Move]{}
+	agent := mcts.NewAgent[tictactoe.Game, tictactoe.Move](tictactoe.New(), evaluator)
 
 	fmt.Println("Tic-tac-toe vs. MCTS. Enter a square number (0-8) to play.")
 	printBoard(agent.State())

@@ -37,12 +37,14 @@ func newNode[S game.GameState[S, M], M comparable](state S, parent *node[S, M], 
 }
 
 type Agent[S game.GameState[S, M], M comparable] struct {
-	root *node[S, M]
+	root      *node[S, M]
+	evaluator Evaluator[S, M]
 }
 
-func NewAgent[S game.GameState[S, M], M comparable](initialState S) *Agent[S, M] {
+func NewAgent[S game.GameState[S, M], M comparable](initialState S, evaluator Evaluator[S, M]) *Agent[S, M] {
 	return &Agent[S, M]{
-		root: newNode(initialState, nil, *new(M)),
+		root:      newNode(initialState, nil, *new(M)),
+		evaluator: evaluator,
 	}
 }
 
@@ -81,7 +83,13 @@ func (a *Agent[S, M]) Search(opts SearchOptions) (M, SearchStats[M]) {
 		leaf := selectLeaf(a.root)
 		expanded := expand(leaf, rng)
 		var result float64
-		result, rolloutBuf = simulate(expanded.state, rng, rolloutBuf)
+		if expanded.state.IsTerminal() {
+			result = expanded.state.Result()
+		} else {
+			var eval Evaluation[M]
+			eval, rolloutBuf = a.evaluator.Evaluate(expanded.state, rng, rolloutBuf)
+			result = eval.Value
+		}
 		backpropagate(expanded, result)
 		iters++
 	}
@@ -176,14 +184,6 @@ func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand)
 	child := newNode(childState, n, move)
 	n.children = append(n.children, child)
 	return child
-}
-
-func simulate[S game.GameState[S, M], M comparable](state S, rng *rand.Rand, buf []M) (float64, []M) {
-	for !state.IsTerminal() {
-		buf = state.LegalMoves(buf)
-		state = state.Apply(buf[rng.IntN(len(buf))])
-	}
-	return state.Result(), buf
 }
 
 func backpropagate[S game.GameState[S, M], M comparable](n *node[S, M], result float64) {

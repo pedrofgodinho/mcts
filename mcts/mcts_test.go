@@ -9,7 +9,8 @@ import (
 
 func TestMCTSvsMCTSAlwaysDraws(t *testing.T) {
 	for trial := range 5 {
-		agent := NewAgent[tictactoe.Game, tictactoe.Move](tictactoe.New())
+		evaluator := RandomRolloutEvaluator[tictactoe.Game, tictactoe.Move]{}
+		agent := NewAgent[tictactoe.Game, tictactoe.Move](tictactoe.New(), evaluator)
 		for !agent.State().IsTerminal() {
 			seed := uint64(trial)*1000 + uint64(agent.State().LegalMoves(nil)[0])
 			move, _ := agent.Search(SearchOptions{
