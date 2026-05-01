@@ -17,7 +17,7 @@ func TestNewGame(t *testing.T) {
 	if g.Winner() != game.None {
 		t.Errorf("new game should have no winner, got %v", g.Winner())
 	}
-	moves := g.LegalMoves()
+	moves := g.LegalMoves(nil)
 	if len(moves) != 9 {
 		t.Errorf("expected 9 legal moves on new board, got %d", len(moves))
 	}
@@ -41,7 +41,7 @@ func TestTurnAlternates(t *testing.T) {
 func TestApplyReducesLegalMoves(t *testing.T) {
 	g := New()
 	g = g.Apply(4)
-	moves := g.LegalMoves()
+	moves := g.LegalMoves(nil)
 	if len(moves) != 8 {
 		t.Errorf("expected 8 legal moves after one move, got %d", len(moves))
 	}
@@ -58,7 +58,7 @@ func TestApplyIsNonMutating(t *testing.T) {
 	if g.CurrentPlayer() != game.Player1 {
 		t.Error("Apply should not mutate the receiver")
 	}
-	moves := g.LegalMoves()
+	moves := g.LegalMoves(nil)
 	if len(moves) != 9 {
 		t.Error("Apply should not mutate the receiver's board")
 	}
@@ -69,7 +69,7 @@ func TestLegalMovesEmptyOnTerminal(t *testing.T) {
 	for _, m := range []Move{0, 3, 1, 4, 2} {
 		g = g.Apply(m)
 	}
-	if g.LegalMoves() != nil {
+	if g.LegalMoves(nil) != nil {
 		t.Error("terminal game should return nil legal moves")
 	}
 }

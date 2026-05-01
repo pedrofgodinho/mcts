@@ -38,18 +38,17 @@ var winLines = [8][3]int{
 }
 
 // LegalMoves returns a slice of legal moves (empty squares) that can be made from the current game state.
-func (g Game) LegalMoves() []Move {
+func (g Game) LegalMoves(buf []Move) []Move {
+	buf = buf[:0]
 	if g.IsTerminal() {
-		return nil
+		return buf
 	}
-
-	moves := make([]Move, 0, 9)
 	for i, sq := range g.board {
 		if sq == game.None {
-			moves = append(moves, Move(i))
+			buf = append(buf, Move(i))
 		}
 	}
-	return moves
+	return buf
 }
 
 // Apply takes a move and returns the new game state resulting from applying that move. It updates the board and switches the turn to the other player.

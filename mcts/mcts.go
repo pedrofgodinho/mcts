@@ -2,14 +2,22 @@ package mcts
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
+	"sort"
+	"time"
 
 	"github.com/pedrofgodinho/mcts/game"
 )
 
 var explorationConstant = math.Sqrt(2)
 
-type node[S game.GameState[S, M], M any] struct {
+type SearchOptions struct {
+	Iterations int           // 0 means run until time budget is exhausted
+	Budget     time.Duration // 0 means run until iteration budget is exhausted
+	Rand       *rand.Rand    // nil means a fresh PCG seeded from time
+}
+
+type node[S game.GameState[S, M], M comparable] struct {
 	state        S
 	parent       *node[S, M]
 	move         M
@@ -19,44 +27,147 @@ type node[S game.GameState[S, M], M any] struct {
 	valueSum     float64
 }
 
-func newNode[S game.GameState[S, M], M any](state S, parent *node[S, M], move M) *node[S, M] {
+func newNode[S game.GameState[S, M], M comparable](state S, parent *node[S, M], move M) *node[S, M] {
 	return &node[S, M]{
 		state:        state,
 		parent:       parent,
 		move:         move,
-		untriedMoves: state.LegalMoves(),
+		untriedMoves: state.LegalMoves(nil),
 	}
 }
 
-// Search performs the Monte Carlo Tree Search algorithm starting from the given root game state and running for the specified number of iterations.
-// It returns the move that was most visited during the search, which is considered the best move to play from the root state.
-func Search[S game.GameState[S, M], M any](root S, iterations int) M {
-	rootNode := newNode[S, M](root, nil, *new(M))
+type Agent[S game.GameState[S, M], M comparable] struct {
+	root *node[S, M]
+}
 
-	for range iterations {
-		leaf := selectLeaf(rootNode)
-		expanded := expand(leaf)
-		result := simulate(expanded.state)
+func NewAgent[S game.GameState[S, M], M comparable](initialState S) *Agent[S, M] {
+	return &Agent[S, M]{
+		root: newNode(initialState, nil, *new(M)),
+	}
+}
+
+func (a *Agent[S, M]) State() S {
+	return a.root.state
+}
+
+// Search runs MCTS under the given options and returns the most-visited move
+// along with statistics about the search.
+// It panics if the agent's current state is terminal.
+func (a *Agent[S, M]) Search(opts SearchOptions) (M, SearchStats[M]) {
+	if a.root.state.IsTerminal() {
+		panic("mcts: Search called on terminal state")
+	}
+	if opts.Iterations <= 0 && opts.Budget <= 0 {
+		panic("mcts: SearchOptions must set Iterations or Budget")
+	}
+	rng := opts.Rand
+	if rng == nil {
+		rng = newDefaultRand()
+	}
+
+	deadline := time.Time{}
+	if opts.Budget > 0 {
+		deadline = time.Now().Add(opts.Budget)
+	}
+
+	var rolloutBuf []M
+
+	start := time.Now()
+	iters := 0
+	for opts.Iterations <= 0 || iters < opts.Iterations {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			break
+		}
+		leaf := selectLeaf(a.root)
+		expanded := expand(leaf, rng)
+		var result float64
+		result, rolloutBuf = simulate(expanded.state, rng, rolloutBuf)
 		backpropagate(expanded, result)
+		iters++
 	}
 
-	return mostVisitedChild(rootNode).move
+	best := mostVisitedChild(a.root)
+	return best.move, a.collectStats(iters, time.Since(start))
 }
 
-func selectLeaf[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
+// collectStats builds a SearchStats snapshot from the current root.
+func (a *Agent[S, M]) collectStats(iterations int, duration time.Duration) SearchStats[M] {
+	perspective := float64(a.root.state.CurrentPlayer())
+	children := make([]ChildStats[M], len(a.root.children))
+	for i, c := range a.root.children {
+		v := (c.valueSum * perspective) / float64(c.visits)
+		children[i] = ChildStats[M]{
+			Move:    c.move,
+			Visits:  c.visits,
+			WinRate: (v + 1) / 2,
+		}
+	}
+	sort.Slice(children, func(i, j int) bool {
+		return children[i].Visits > children[j].Visits
+	})
+	return SearchStats[M]{
+		Iterations:         iterations,
+		Duration:           duration,
+		RootVisits:         a.root.visits,
+		Children:           children,
+		PrincipalVariation: collectPV(a.root),
+	}
+}
+
+// collectPV walks from the given node, taking the most-visited child each step,
+// and returns the sequence as PVSteps. The starting node itself is not included
+// (the PV is the moves *from* the root, not the root state).
+func collectPV[S game.GameState[S, M], M comparable](root *node[S, M]) []PVStep[M] {
+	var pv []PVStep[M]
+	n := root
+	for len(n.children) > 0 {
+		best := mostVisitedChild(n)
+		// WinRate from the perspective of the player to move at n
+		// (i.e., the player choosing this move).
+		perspective := float64(n.state.CurrentPlayer())
+		v := (best.valueSum * perspective) / float64(best.visits)
+		pv = append(pv, PVStep[M]{
+			Move:    best.move,
+			Visits:  best.visits,
+			WinRate: (v + 1) / 2,
+		})
+		n = best
+	}
+	return pv
+}
+
+// Advance applies the given move to the current state and promotes the
+// corresponding child (if it exists in the tree) to be the new root.
+// If no child m exists, a fresh root is built from Apply(m).
+func (a *Agent[S, M]) Advance(m M) {
+	for _, c := range a.root.children {
+		if c.move == m {
+			c.parent = nil
+			a.root = c
+			return
+		}
+	}
+	newState := a.root.state.Apply(m)
+	a.root = newNode(newState, nil, *new(M))
+}
+
+func newDefaultRand() *rand.Rand {
+	now := uint64(time.Now().UnixNano())
+	return rand.New(rand.NewPCG(now, now^0x9E3779B97F4A7C15))
+}
+
+func selectLeaf[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
 	for len(n.untriedMoves) == 0 && len(n.children) > 0 {
 		n = bestUCBChild(n)
 	}
 	return n
 }
 
-func expand[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
+func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand) *node[S, M] {
 	if len(n.untriedMoves) == 0 {
 		return n
 	}
-
-	// Selecting random move rather than first to avoid move gen order bias
-	idx := rand.Intn(len(n.untriedMoves))
+	idx := rng.IntN(len(n.untriedMoves))
 	move := n.untriedMoves[idx]
 	n.untriedMoves[idx] = n.untriedMoves[len(n.untriedMoves)-1]
 	n.untriedMoves = n.untriedMoves[:len(n.untriedMoves)-1]
@@ -67,15 +178,15 @@ func expand[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
 	return child
 }
 
-func simulate[S game.GameState[S, M], M any](state S) float64 {
+func simulate[S game.GameState[S, M], M comparable](state S, rng *rand.Rand, buf []M) (float64, []M) {
 	for !state.IsTerminal() {
-		moves := state.LegalMoves()
-		state = state.Apply(moves[rand.Intn(len(moves))])
+		buf = state.LegalMoves(buf)
+		state = state.Apply(buf[rng.IntN(len(buf))])
 	}
-	return state.Result()
+	return state.Result(), buf
 }
 
-func backpropagate[S game.GameState[S, M], M any](n *node[S, M], result float64) {
+func backpropagate[S game.GameState[S, M], M comparable](n *node[S, M], result float64) {
 	for n != nil {
 		n.visits++
 		n.valueSum += result
@@ -83,7 +194,7 @@ func backpropagate[S game.GameState[S, M], M any](n *node[S, M], result float64)
 	}
 }
 
-func bestUCBChild[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
+func bestUCBChild[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
 	var best *node[S, M]
 	bestScore := math.Inf(-1)
 	parentVisitsLog := math.Log(float64(n.visits))
@@ -101,7 +212,7 @@ func bestUCBChild[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
 	return best
 }
 
-func mostVisitedChild[S game.GameState[S, M], M any](n *node[S, M]) *node[S, M] {
+func mostVisitedChild[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
 	var best *node[S, M]
 	bestVisits := -1
 	for _, c := range n.children {

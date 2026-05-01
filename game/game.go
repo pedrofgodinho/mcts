@@ -10,8 +10,11 @@ const (
 
 // GameState represents the state of a game and defines the necessary methods for a game to be used with MCTS.
 type GameState[S GameState[S, M], M any] interface {
-	// LegalMoves returns a slice of legal moves that can be made from the current game state.
-	LegalMoves() []M
+	// LegalMoves appends the legal moves at this state to buf and returns the result.
+	// buf is treated as a buffer; existing contents are discarded (callers should
+	// pass nil or a slice from a previous call, optionally re-sliced to [:0]).
+	// Returns an empty slice (not nil) iff IsTerminal() is true.
+	LegalMoves(buf []M) []M
 	// Apply takes a move and returns the new game state resulting from applying that move.
 	Apply(M) S
 	// IsTerminal returns true if the game has reached a terminal state (i.e., a win, loss, or draw), and false otherwise.
