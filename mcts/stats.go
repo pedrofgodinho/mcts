@@ -6,7 +6,7 @@ import "time"
 type SearchStats[M comparable] struct {
 	Iterations         int
 	Duration           time.Duration
-	RootVisits         int
+	RootVisits         int64
 	Children           []ChildStats[M]
 	PrincipalVariation []PVStep[M]
 }
@@ -15,7 +15,7 @@ type SearchStats[M comparable] struct {
 // WinRate is from the perspective of the player to move at the root
 type ChildStats[M comparable] struct {
 	Move    M
-	Visits  int
+	Visits  int64
 	WinRate float64
 }
 
@@ -23,6 +23,6 @@ type ChildStats[M comparable] struct {
 // perspective of the player to move at that step.
 type PVStep[M comparable] struct {
 	Move    M
-	Visits  int
+	Visits  int64
 	WinRate float64
 }

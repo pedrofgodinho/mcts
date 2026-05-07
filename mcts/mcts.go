@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pedrofgodinho/mcts/game"
@@ -18,22 +20,48 @@ type SearchOptions struct {
 }
 
 type node[S game.GameState[S, M], M comparable] struct {
-	state        S
-	parent       *node[S, M]
-	move         M
+	// Immutable after newNode.
+	state  S
+	parent *node[S, M]
+	move   M
+
+	// Statistics, atomic. Read during selection, written during backpropagation.
+	visits atomic.Int64
+	// valueSum is float64 but stored as uint64 using math.Float64bits to allow atomic updates.
+	valueSum atomic.Uint64
+
+	// Tree structure, protected by mu. children and untriedMoves are locked
+	// together since they are modified together during expansion.
+	mu           sync.RWMutex
 	children     []*node[S, M]
 	untriedMoves []M
-	visits       int
-	valueSum     float64
 }
 
 func newNode[S game.GameState[S, M], M comparable](state S, parent *node[S, M], move M) *node[S, M] {
+	// No locking needed since the new node is not yet reachable by other goroutines.
 	return &node[S, M]{
 		state:        state,
 		parent:       parent,
 		move:         move,
 		untriedMoves: state.LegalMoves(nil),
 	}
+}
+
+// addValue atomically adds v to valueSum using a CAS loop.
+// Retries if another goroutine updates valueSum between Load and CompareAndSwap.
+func (n *node[S, M]) addValue(v float64) {
+	for {
+		old := n.valueSum.Load()
+		newBits := math.Float64bits(math.Float64frombits(old) + v)
+		if n.valueSum.CompareAndSwap(old, newBits) {
+			break
+		}
+	}
+}
+
+// loadValue atomically loads valueSum and converts it to float64.
+func (n *node[S, M]) loadValue() float64 {
+	return math.Float64frombits(n.valueSum.Load())
 }
 
 type Agent[S game.GameState[S, M], M comparable] struct {
@@ -94,29 +122,38 @@ func (a *Agent[S, M]) Search(opts SearchOptions) (M, SearchStats[M]) {
 		iters++
 	}
 
-	best := mostVisitedChild(a.root)
-	return best.move, a.collectStats(iters, time.Since(start))
+	a.root.mu.RLock()
+	best := mostVisitedChildLocked(a.root)
+	bestMove := best.move
+	a.root.mu.RUnlock()
+	return bestMove, a.collectStats(iters, time.Since(start))
 }
 
 // collectStats builds a SearchStats snapshot from the current root.
 func (a *Agent[S, M]) collectStats(iterations int, duration time.Duration) SearchStats[M] {
 	perspective := float64(a.root.state.CurrentPlayer())
+
+	a.root.mu.RLock()
 	children := make([]ChildStats[M], len(a.root.children))
 	for i, c := range a.root.children {
-		v := (c.valueSum * perspective) / float64(c.visits)
+		visits := c.visits.Load()
+		v := (c.loadValue() * perspective) / float64(visits)
 		children[i] = ChildStats[M]{
 			Move:    c.move,
-			Visits:  c.visits,
+			Visits:  visits,
 			WinRate: (v + 1) / 2,
 		}
 	}
+	rootVisits := a.root.visits.Load()
+	a.root.mu.RUnlock()
+
 	sort.Slice(children, func(i, j int) bool {
 		return children[i].Visits > children[j].Visits
 	})
 	return SearchStats[M]{
 		Iterations:         iterations,
 		Duration:           duration,
-		RootVisits:         a.root.visits,
+		RootVisits:         rootVisits,
 		Children:           children,
 		PrincipalVariation: collectPV(a.root),
 	}
@@ -128,25 +165,38 @@ func (a *Agent[S, M]) collectStats(iterations int, duration time.Duration) Searc
 func collectPV[S game.GameState[S, M], M comparable](root *node[S, M]) []PVStep[M] {
 	var pv []PVStep[M]
 	n := root
-	for len(n.children) > 0 {
-		best := mostVisitedChild(n)
+	for {
+		n.mu.RLock()
+		var best *node[S, M]
+		if len(n.children) > 0 {
+			best = mostVisitedChildLocked(n)
+		}
+		if best == nil {
+			n.mu.RUnlock()
+			return pv
+		}
 		// WinRate from the perspective of the player to move at n
 		// (i.e., the player choosing this move).
 		perspective := float64(n.state.CurrentPlayer())
-		v := (best.valueSum * perspective) / float64(best.visits)
+		visits := best.visits.Load()
+		v := (best.loadValue() * perspective) / float64(visits)
+		n.mu.RUnlock()
+
 		pv = append(pv, PVStep[M]{
 			Move:    best.move,
-			Visits:  best.visits,
+			Visits:  visits,
 			WinRate: (v + 1) / 2,
 		})
 		n = best
 	}
-	return pv
 }
 
 // Advance applies the given move to the current state and promotes the
 // corresponding child (if it exists in the tree) to be the new root.
 // If no child m exists, a fresh root is built from Apply(m).
+//
+// Advance must not be called concurrently with Search; callers must wait
+// for any in-flight Search to return before calling Advance.
 func (a *Agent[S, M]) Advance(m M) {
 	for _, c := range a.root.children {
 		if c.move == m {
@@ -165,13 +215,24 @@ func newDefaultRand() *rand.Rand {
 }
 
 func selectLeaf[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
-	for len(n.untriedMoves) == 0 && len(n.children) > 0 {
-		n = bestUCBChild(n)
+	for {
+		n.mu.RLock()
+		canDescend := len(n.untriedMoves) == 0 && len(n.children) > 0
+		var next *node[S, M]
+		if canDescend {
+			next = bestUCBChildLocked(n)
+		}
+		n.mu.RUnlock()
+		if !canDescend {
+			return n
+		}
+		n = next
 	}
-	return n
 }
 
 func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand) *node[S, M] {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if len(n.untriedMoves) == 0 {
 		return n
 	}
@@ -188,21 +249,27 @@ func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand)
 
 func backpropagate[S game.GameState[S, M], M comparable](n *node[S, M], result float64) {
 	for n != nil {
-		n.visits++
-		n.valueSum += result
+		n.visits.Add(1)
+		// visits and valueSum are not updated atomically together; a reader
+		// can briefly see one updated and not the other. MCTS tolerates this
+		// noise.
+		n.addValue(result)
 		n = n.parent
 	}
 }
 
-func bestUCBChild[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
+// bestUCBChildLocked returns the child with the highest UCB score.
+// The caller must hold n.mu.
+func bestUCBChildLocked[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
 	var best *node[S, M]
 	bestScore := math.Inf(-1)
-	parentVisitsLog := math.Log(float64(n.visits))
+	parentVisitsLog := math.Log(float64(n.visits.Load()))
 	perspective := float64(n.state.CurrentPlayer())
 
 	for _, child := range n.children {
-		exploitation := (child.valueSum * perspective) / float64(child.visits)
-		exploration := explorationConstant * math.Sqrt(parentVisitsLog/float64(child.visits))
+		v := child.visits.Load()
+		exploitation := (child.loadValue() * perspective) / float64(v)
+		exploration := explorationConstant * math.Sqrt(parentVisitsLog/float64(v))
 		score := exploitation + exploration
 		if score > bestScore {
 			bestScore = score
@@ -212,12 +279,15 @@ func bestUCBChild[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, 
 	return best
 }
 
-func mostVisitedChild[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
+// mostVisitedChildLocked returns the child with the highest visit count.
+// The caller must hold n.mu.
+func mostVisitedChildLocked[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
 	var best *node[S, M]
-	bestVisits := -1
+	var bestVisits int64 = -1
 	for _, c := range n.children {
-		if c.visits > bestVisits {
-			bestVisits = c.visits
+		v := c.visits.Load()
+		if v > bestVisits {
+			bestVisits = v
 			best = c
 		}
 	}
