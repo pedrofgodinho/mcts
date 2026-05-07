@@ -14,9 +14,10 @@ import (
 var explorationConstant = math.Sqrt(2)
 
 type SearchOptions struct {
-	Iterations int           // 0 means run until time budget is exhausted
-	Budget     time.Duration // 0 means run until iteration budget is exhausted
-	Rand       *rand.Rand    // nil means a fresh PCG seeded from time
+	Iterations  int           // 0 means run until time budget is exhausted
+	Budget      time.Duration // 0 means run until iteration budget is exhausted
+	Rand        *rand.Rand    // nil means a fresh PCG seeded from time
+	VirtualLoss int           // Number of virtual loss visits to apply during selection. 0 means no virtual loss. 1-3 is a common range to try
 }
 
 type node[S game.GameState[S, M], M comparable] struct {
@@ -64,6 +65,16 @@ func (n *node[S, M]) loadValue() float64 {
 	return math.Float64frombits(n.valueSum.Load())
 }
 
+func (n *node[S, M]) applyVirtualLoss(vl int, parentPerspective float64) {
+	n.visits.Add(int64(vl))
+	n.addValue(-float64(vl) * parentPerspective)
+}
+
+func (n *node[S, M]) revertVirtualLoss(vl int, parentPerspective float64) {
+	n.visits.Add(int64(-vl))
+	n.addValue(float64(vl) * parentPerspective)
+}
+
 type Agent[S game.GameState[S, M], M comparable] struct {
 	root      *node[S, M]
 	evaluator Evaluator[S, M]
@@ -78,6 +89,63 @@ func NewAgent[S game.GameState[S, M], M comparable](initialState S, evaluator Ev
 
 func (a *Agent[S, M]) State() S {
 	return a.root.state
+}
+
+func (a *Agent[S, M]) iterate(rng *rand.Rand, rolloutBuf []M, vl int) []M {
+	path := selectAndExpand(a.root, rng, vl)
+	leaf := path[len(path)-1]
+
+	var result float64
+	if leaf.state.IsTerminal() {
+		result = leaf.state.Result()
+	} else {
+		var eval Evaluation[M]
+		eval, rolloutBuf = a.evaluator.Evaluate(leaf.state, rng, rolloutBuf)
+		result = eval.Value
+	}
+
+	backpropagatePath(path, result, vl)
+	return rolloutBuf
+}
+
+func selectAndExpand[S game.GameState[S, M], M comparable](root *node[S, M], rng *rand.Rand, vl int) []*node[S, M] {
+	path := []*node[S, M]{root}
+	n := root
+	for {
+		n.mu.RLock()
+		canDescend := len(n.untriedMoves) == 0 && len(n.children) > 0
+		var next *node[S, M]
+		if canDescend {
+			next = bestUCBChildLocked(n)
+		}
+		parentPerspective := float64(n.state.CurrentPlayer())
+		n.mu.RUnlock()
+
+		if !canDescend {
+			child := expand(n, rng)
+			if child != n {
+				child.applyVirtualLoss(vl, parentPerspective)
+				path = append(path, child)
+			}
+			return path
+		}
+
+		next.applyVirtualLoss(vl, parentPerspective)
+		path = append(path, next)
+		n = next
+	}
+}
+
+func backpropagatePath[S game.GameState[S, M], M comparable](path []*node[S, M], result float64, vl int) {
+	for i := 1; i < len(path); i++ {
+		parent := path[i-1]
+		parentPerspective := float64(parent.state.CurrentPlayer())
+		path[i].revertVirtualLoss(vl, parentPerspective)
+	}
+	for _, n := range path {
+		n.visits.Add(1)
+		n.addValue(result)
+	}
 }
 
 // Search runs MCTS under the given options and returns the most-visited move
@@ -104,21 +172,12 @@ func (a *Agent[S, M]) Search(opts SearchOptions) (M, SearchStats[M]) {
 
 	start := time.Now()
 	iters := 0
+
 	for opts.Iterations <= 0 || iters < opts.Iterations {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			break
 		}
-		leaf := selectLeaf(a.root)
-		expanded := expand(leaf, rng)
-		var result float64
-		if expanded.state.IsTerminal() {
-			result = expanded.state.Result()
-		} else {
-			var eval Evaluation[M]
-			eval, rolloutBuf = a.evaluator.Evaluate(expanded.state, rng, rolloutBuf)
-			result = eval.Value
-		}
-		backpropagate(expanded, result)
+		rolloutBuf = a.iterate(rng, rolloutBuf, opts.VirtualLoss)
 		iters++
 	}
 
@@ -214,22 +273,6 @@ func newDefaultRand() *rand.Rand {
 	return rand.New(rand.NewPCG(now, now^0x9E3779B97F4A7C15))
 }
 
-func selectLeaf[S game.GameState[S, M], M comparable](n *node[S, M]) *node[S, M] {
-	for {
-		n.mu.RLock()
-		canDescend := len(n.untriedMoves) == 0 && len(n.children) > 0
-		var next *node[S, M]
-		if canDescend {
-			next = bestUCBChildLocked(n)
-		}
-		n.mu.RUnlock()
-		if !canDescend {
-			return n
-		}
-		n = next
-	}
-}
-
 func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand) *node[S, M] {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -245,17 +288,6 @@ func expand[S game.GameState[S, M], M comparable](n *node[S, M], rng *rand.Rand)
 	child := newNode(childState, n, move)
 	n.children = append(n.children, child)
 	return child
-}
-
-func backpropagate[S game.GameState[S, M], M comparable](n *node[S, M], result float64) {
-	for n != nil {
-		n.visits.Add(1)
-		// visits and valueSum are not updated atomically together; a reader
-		// can briefly see one updated and not the other. MCTS tolerates this
-		// noise.
-		n.addValue(result)
-		n = n.parent
-	}
 }
 
 // bestUCBChildLocked returns the child with the highest UCB score.
