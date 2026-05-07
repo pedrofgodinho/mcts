@@ -45,6 +45,26 @@ func TestMCTSvsMCTSAlwaysDrawsWithVirtualLoss(t *testing.T) {
 	}
 }
 
+func TestMCTSvsMCTSAlwaysDrawsWithWorkers(t *testing.T) {
+	for trial := range 5 {
+		evaluator := RandomRolloutEvaluator[tictactoe.Game, tictactoe.Move]{}
+		agent := NewAgent[tictactoe.Game, tictactoe.Move](tictactoe.New(), evaluator)
+		for !agent.State().IsTerminal() {
+			seed := uint64(trial)*1000 + uint64(agent.State().LegalMoves(nil)[0])
+			move, _ := agent.Search(SearchOptions{
+				Iterations:  5000,
+				Rand:        rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15)),
+				VirtualLoss: 1,
+				Workers:     4,
+			})
+			agent.Advance(move)
+		}
+		if agent.State().Result() != 0 {
+			t.Errorf("trial %d: expected draw, got result %v", trial, agent.State().Result())
+		}
+	}
+}
+
 func TestVirtualLossRoundTrip(t *testing.T) {
 	var n node[tictactoe.Game, tictactoe.Move]
 	n.addValue(0.3)

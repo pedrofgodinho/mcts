@@ -16,8 +16,10 @@ import (
 )
 
 func main() {
-	iterations := flag.Int("iterations", 10000, "MCTS iterations per move")
+	iterations := flag.Int("iterations", 10000, "MCTS iterations per move (0 = use budget)")
 	budget := flag.Duration("budget", 0, "MCTS time budget per move (0 = use iterations)")
+	virtualLoss := flag.Int("virtual-loss", 1, "virtual loss per selection (0 = disabled)")
+	workers := flag.Int("workers", 1, "parallel MCTS workers (1 = sequential)")
 	humanFirst := flag.Bool("first", true, "human plays first (X)")
 	verbose := flag.Bool("verbose", false, "print MCTS statistics after each move")
 	flag.Parse()
@@ -27,7 +29,11 @@ func main() {
 		humanPlayer = game.Player2
 	}
 
-	opts := mcts.SearchOptions{Iterations: *iterations}
+	opts := mcts.SearchOptions{
+		Iterations:  *iterations,
+		VirtualLoss: *virtualLoss,
+		Workers:     *workers,
+	}
 	if *budget > 0 {
 		opts.Budget = *budget
 		opts.Iterations = 0
